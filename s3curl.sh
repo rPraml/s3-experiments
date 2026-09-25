@@ -243,6 +243,8 @@ sign_and_curl() {
     local credential_scope string_to_sign signing_key signature
     local auth
     local tmp_headers tmp_body http_code curl_rc
+    S3_RESPONSE_ETAG=""
+    S3_RESPONSE_LENGTH=""
 
     amz_date="$(date -u '+%Y%m%dT%H%M%SZ')" ||
         die "cannot determine UTC time"
@@ -323,6 +325,13 @@ sign_and_curl() {
         --dump-header "$tmp_headers"
     )
 
+    if [[ "$method" == "HEAD" ]]; then
+        # Some S3-compatible servers advertise a Content-Length on HEAD but
+        # do not send a body; --head prevents curl from treating that as a
+        # truncated response.
+        curl_args+=(--head)
+    fi
+
     if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
         curl_args+=(--header "x-amz-security-token: ${AWS_SESSION_TOKEN}")
     fi
@@ -369,6 +378,8 @@ sign_and_curl() {
     curl_rc=$?
 
     http_code="$(awk 'NR==1 {print $2; exit}' "$tmp_headers" 2>/dev/null || true)"
+    S3_RESPONSE_ETAG="$(awk 'tolower($1) == "etag:" { sub(/\r$/, ""); sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$tmp_headers" 2>/dev/null || true)"
+    S3_RESPONSE_LENGTH="$(awk 'tolower($1) == "content-length:" { sub(/\r$/, ""); sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$tmp_headers" 2>/dev/null || true)"
     debug "response: curl exit=${curl_rc}, HTTP ${http_code:-unknown}"
     if [[ "${S3CURL_DEBUG:-0}" == "1" && -s "$tmp_headers" ]]; then
         debug "response headers:"
@@ -516,11 +527,25 @@ cmd_delete() {
 }
 
 # ---------------------------------------------------------------------------
-# rename = CopyObject + DeleteObject
+# rename = CopyObject + verified DeleteObject
 #
 # x-amz-copy-source is URL encoded. It is a signed x-amz-* header, therefore
-# it must appear in canonical headers too.
+# it must appear in canonical headers too. S3 has no portable atomic rename;
+# verify the destination before deleting the source.
 # ---------------------------------------------------------------------------
+head_object() {
+    local key="$1"
+    sign_and_curl \
+        "HEAD" \
+        "$(canonical_object_path "$key")" \
+        "" \
+        "$(object_url "$key")" \
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+        "" \
+        "" \
+        "discard"
+}
+
 cmd_rename() {
     [[ $# -eq 2 ]] || die "usage: $SCRIPT_NAME rename OLD_S3_KEY NEW_S3_KEY"
     local old_key="$1"
@@ -542,6 +567,32 @@ cmd_rename() {
         "x-amz-copy-source" \
         "$copy_source" \
         "discard" || return $?
+
+    local source_etag source_length destination_etag destination_length
+    head_object "$old_key" || {
+        echo "ERROR: source verification failed; source was not deleted" >&2
+        return 1
+    }
+    source_etag="$S3_RESPONSE_ETAG"
+    source_length="$S3_RESPONSE_LENGTH"
+
+    head_object "$new_key" || {
+        echo "ERROR: destination verification failed; source was not deleted" >&2
+        return 1
+    }
+    destination_etag="$S3_RESPONSE_ETAG"
+    destination_length="$S3_RESPONSE_LENGTH"
+
+    if [[ -n "$source_length" && -n "$destination_length" &&
+          "$source_length" != "$destination_length" ]]; then
+        echo "ERROR: destination size differs; source was not deleted" >&2
+        return 1
+    fi
+    if [[ -n "$source_etag" && -n "$destination_etag" &&
+          "$source_etag" != "$destination_etag" ]]; then
+        echo "ERROR: destination ETag differs; source was not deleted" >&2
+        return 1
+    fi
 
     cmd_delete "$old_key"
 }
