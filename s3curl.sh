@@ -16,6 +16,8 @@
 #   AWS_SESSION_TOKEN     (optional, for temporary credentials)
 #   AWS_REGION             (default: eu-central-1)
 #   S3_BUCKET              (required)
+#   S3CURL_DEBUG=1         log signing and HTTP-response diagnostics
+#   S3CURL_CURL_VERBOSE=1  enable curl's raw verbose output (may expose credentials)
 #
 # Example:
 #   export AWS_ACCESS_KEY_ID='AKIA...'
@@ -54,6 +56,11 @@ die() {
     exit 1
 }
 
+debug() {
+    [[ "${S3CURL_DEBUG:-0}" == "1" ]] || return 0
+    printf 'DEBUG: %s\n' "$*" >&2
+}
+
 usage() {
     cat >&2 <<EOF
 Usage:
@@ -71,6 +78,8 @@ Environment:
   AWS_REGION              default: eu-central-1
   S3_BUCKET               bucket name
   S3_ENDPOINT              optional, defaults to AWS virtual-hosted endpoint
+  S3CURL_DEBUG=1           log request/signing diagnostics (without secrets)
+  S3CURL_CURL_VERBOSE=1    enable curl -v; may expose credentials, use only locally
 
 Examples:
   export AWS_REGION=eu-central-1
@@ -222,8 +231,12 @@ sign_and_curl() {
     host="${actual_url#https://}"
     host="${host%%/*}"
 
+    # SigV4 requires every x-amz-* header sent to S3 to also be signed.
+    # Canonical headers must furthermore be sorted lexicographically.
     canonical_headers="host:${host}"$'\n'
     signed_headers="host"
+    canonical_headers+="x-amz-content-sha256:${payload_hash}"$'\n'
+    signed_headers+=";x-amz-content-sha256"
 
     if [[ -n "$extra_name" ]]; then
         # Header names are lower-case in the canonical representation.
@@ -231,6 +244,9 @@ sign_and_curl() {
         canonical_headers+="${lower_name}:${extra_value}"$'\n'
         signed_headers+=";${lower_name}"
     fi
+
+    canonical_headers+="x-amz-date:${amz_date}"$'\n'
+    signed_headers+=";x-amz-date"
 
     # Temporary session credentials require x-amz-security-token to be signed.
     if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
@@ -258,6 +274,14 @@ sign_and_curl() {
     signature="$(hmac_sha256_hex "$signing_key" "$string_to_sign")"
 
     auth="AWS4-HMAC-SHA256 Credential=${AWS_ACCESS_KEY_ID}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+    # Do not log the Authorization value, secret key, or session token.
+    debug "request: ${method} ${actual_url}"
+    debug "payload SHA256: ${payload_hash}"
+    debug "signed headers: ${signed_headers}"
+    debug "canonical request SHA256: ${canonical_request_hash}"
+    debug "credential scope: ${credential_scope}"
+    debug "signature: ${signature}"
 
     tmp_headers="$(mktemp)" || die "mktemp failed"
     tmp_body="$(mktemp)" || {
@@ -305,12 +329,30 @@ sign_and_curl() {
     # For PUT object, the caller adds --upload-file via S3_UPLOAD_FILE.
     if [[ -n "${S3_UPLOAD_FILE:-}" ]]; then
         curl_args+=(--upload-file "$S3_UPLOAD_FILE")
+        debug "upload file: ${S3_UPLOAD_FILE} ($(wc -c < "$S3_UPLOAD_FILE") bytes)"
+    elif [[ "$method" == "PUT" ]]; then
+        # curl otherwise sends a PUT with no Content-Length at all. S3
+        # rejects that for zero-byte directory markers and CopyObject bodies.
+        curl_args+=(--header "Content-Length: 0")
+        debug "upload body: empty (Content-Length: 0)"
+    fi
+
+    # curl -v includes the Authorization and possibly session-token headers.
+    # Make it opt-in separately from the safe S3CURL_DEBUG diagnostics.
+    if [[ "${S3CURL_CURL_VERBOSE:-0}" == "1" ]]; then
+        debug "WARNING: curl verbose output can contain credentials"
+        curl_args+=(--verbose)
     fi
 
     curl "${curl_args[@]}" 2>"${tmp_body}.err"
     curl_rc=$?
 
     http_code="$(awk 'NR==1 {print $2; exit}' "$tmp_headers" 2>/dev/null || true)"
+    debug "response: curl exit=${curl_rc}, HTTP ${http_code:-unknown}"
+    if [[ "${S3CURL_DEBUG:-0}" == "1" && -s "$tmp_headers" ]]; then
+        debug "response headers:"
+        sed 's/\r$//' "$tmp_headers" >&2
+    fi
 
     if [[ $curl_rc -ne 0 ]]; then
         cat "${tmp_body}.err" >&2
@@ -544,12 +586,27 @@ cmd_ls() {
             "" \
             "file:$tmp" || return $?
 
-        # Basic XML extraction using standard POSIX tools.
-        # Object keys are printed exactly as returned by S3 for normal keys.
-        sed -n 's:.*<Key>\(.*\)</Key>.*:\1:p' "$tmp"
+        # Basic XML extraction using standard POSIX tools. S3 commonly sends
+        # the XML as one line, so put one tag on each line first. In
+        # particular, do not treat the top-level <Prefix> as a directory.
+        # Object keys and CommonPrefixes already contain any trailing slash.
+        sed 's/></>\
+</g' "$tmp" |
+            sed -n 's:^<Key>\(.*\)</Key>$:\1:p' |
+            # Do not show the directory marker for the prefix being listed.
+            awk -v directory_marker="$prefix" '$0 != directory_marker'
 
-        # CommonPrefixes represent the immediate subdirectories.
-        sed -n 's:.*<Prefix>\(.*\)</Prefix>.*:\1/:p' "$tmp"
+        sed 's/></>\
+</g' "$tmp" |
+            awk '
+                $0 == "<CommonPrefixes>" { in_common_prefix=1; next }
+                $0 == "</CommonPrefixes>" { in_common_prefix=0; next }
+                in_common_prefix && /^<Prefix>.*<\/Prefix>$/ {
+                    sub(/^<Prefix>/, "")
+                    sub(/<\/Prefix>$/, "")
+                    print
+                }
+            '
 
         # ListObjectsV2 pagination.
         if grep -q '<IsTruncated>true</IsTruncated>' "$tmp"; then
