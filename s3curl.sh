@@ -7,14 +7,17 @@
 #   get     S3_KEY LOCAL_FILE
 #   delete  S3_KEY
 #   rename  OLD_S3_KEY NEW_S3_KEY
-#   mkdir   S3_PREFIX
-#   ls      [S3_PREFIX]
+#   mkdir    S3_PREFIX
+#   mb       create bucket (S3_BUCKET)
+#   ls       [S3_PREFIX]
 #
 # Credentials:
 #   AWS_ACCESS_KEY_ID
 #   AWS_SECRET_ACCESS_KEY
 #   AWS_SESSION_TOKEN     (optional, for temporary credentials)
-#   AWS_REGION             (default: eu-central-1)
+#   AWS_REGION             (default: eu-central-1; used for signing)
+#   S3_ENDPOINT             complete S3 service URL; custom endpoints use path-style
+#   S3_PATH_STYLE           1/0; defaults to 1 for custom endpoints, 0 for AWS
 #   S3_BUCKET              (required)
 #   S3CURL_DEBUG=1         log signing and HTTP-response diagnostics
 #   S3CURL_CURL_VERBOSE=1  enable curl's raw verbose output (may expose credentials)
@@ -24,6 +27,9 @@
 #   export AWS_SECRET_ACCESS_KEY='...'
 #   export AWS_REGION='eu-central-1'
 #   export S3_BUCKET='my-bucket'
+#   # For RustFS/MinIO and other S3-compatible services:
+#   # export S3_ENDPOINT='http://127.0.0.1:9000'
+#   # export S3_PATH_STYLE=1
 #
 #   ./s3curl.sh put file.txt backup/file.txt
 #   ./s3curl.sh get backup/file.txt downloaded.txt
@@ -49,7 +55,18 @@ set -o pipefail
 SCRIPT_NAME="${0##*/}"
 
 : "${AWS_REGION:=eu-central-1}"
-: "${S3_ENDPOINT:=https://${S3_BUCKET:-}.s3.${AWS_REGION}.amazonaws.com}"
+_s3_endpoint_was_set="${S3_ENDPOINT+x}"
+if [[ -z "${S3_ENDPOINT:-}" ]]; then
+    S3_ENDPOINT="https://${S3_BUCKET:-}.s3.${AWS_REGION}.amazonaws.com"
+fi
+S3_ENDPOINT="${S3_ENDPOINT%/}"
+if [[ -z "${S3_PATH_STYLE+x}" ]]; then
+    if [[ -n "${_s3_endpoint_was_set}" ]]; then
+        S3_PATH_STYLE=1
+    else
+        S3_PATH_STYLE=0
+    fi
+fi
 
 die() {
     echo "ERROR: $*" >&2
@@ -69,15 +86,17 @@ Usage:
   $SCRIPT_NAME delete S3_KEY
   $SCRIPT_NAME rename OLD_S3_KEY NEW_S3_KEY
   $SCRIPT_NAME mkdir  S3_PREFIX
+  $SCRIPT_NAME mb
   $SCRIPT_NAME ls     [S3_PREFIX]
 
 Environment:
   AWS_ACCESS_KEY_ID       AWS access key
   AWS_SECRET_ACCESS_KEY   AWS secret access key
   AWS_SESSION_TOKEN       optional temporary-session token
-  AWS_REGION              default: eu-central-1
+  AWS_REGION              signing region (default: eu-central-1)
   S3_BUCKET               bucket name
-  S3_ENDPOINT              optional, defaults to AWS virtual-hosted endpoint
+  S3_ENDPOINT              complete service URL; e.g. http://127.0.0.1:9000
+  S3_PATH_STYLE            1 for /bucket/key URLs, 0 for virtual-hosted URLs
   S3CURL_DEBUG=1           log request/signing diagnostics (without secrets)
   S3CURL_CURL_VERBOSE=1    enable curl -v; may expose credentials, use only locally
 
@@ -90,6 +109,7 @@ Examples:
   $SCRIPT_NAME ls
   $SCRIPT_NAME ls backup/
   $SCRIPT_NAME mkdir backup/2026/
+  $SCRIPT_NAME mb
   $SCRIPT_NAME rename backup/a.txt backup/b.txt
   $SCRIPT_NAME delete backup/b.txt
 EOF
@@ -228,7 +248,7 @@ sign_and_curl() {
         die "cannot determine UTC time"
     date_stamp="${amz_date:0:8}"
 
-    host="${actual_url#https://}"
+    host="${actual_url#*://}"
     host="${host%%/*}"
 
     # SigV4 requires every x-amz-* header sent to S3 to also be signed.
@@ -282,6 +302,7 @@ sign_and_curl() {
     debug "canonical request SHA256: ${canonical_request_hash}"
     debug "credential scope: ${credential_scope}"
     debug "signature: ${signature}"
+    debug "endpoint mode: path-style=${S3_PATH_STYLE}, region=${AWS_REGION}"
 
     tmp_headers="$(mktemp)" || die "mktemp failed"
     tmp_body="$(mktemp)" || {
@@ -378,9 +399,31 @@ sign_and_curl() {
     return 0
 }
 
-# Build bucket endpoint. S3 virtual-hosted style is used.
+# Build bucket/object endpoints. AWS normally uses virtual-hosted style;
+# custom S3-compatible endpoints default to path-style.
 bucket_url() {
-    printf '%s' "$S3_ENDPOINT"
+    if [[ "$S3_PATH_STYLE" == 1 ]]; then
+        printf '%s/%s' "$S3_ENDPOINT" "$(uri_encode "$S3_BUCKET" 0)"
+    else
+        printf '%s' "$S3_ENDPOINT"
+    fi
+}
+
+canonical_object_path() {
+    local key="$1"
+    if [[ "$S3_PATH_STYLE" == 1 ]]; then
+        canonical_key_path "${S3_BUCKET}/${key}"
+    else
+        canonical_key_path "$key"
+    fi
+}
+
+canonical_bucket_list_path() {
+    if [[ "$S3_PATH_STYLE" == 1 ]]; then
+        canonical_key_path "${S3_BUCKET}/"
+    else
+        printf '/'
+    fi
 }
 
 object_url() {
@@ -407,7 +450,7 @@ cmd_put() {
 
     sign_and_curl \
         "PUT" \
-        "$(canonical_key_path "$key")" \
+        "$(canonical_object_path "$key")" \
         "" \
         "$(object_url "$key")" \
         "$payload_hash" \
@@ -435,7 +478,7 @@ cmd_get() {
 
     sign_and_curl \
         "GET" \
-        "$(canonical_key_path "$key")" \
+        "$(canonical_object_path "$key")" \
         "" \
         "$(object_url "$key")" \
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
@@ -463,7 +506,7 @@ cmd_delete() {
 
     sign_and_curl \
         "DELETE" \
-        "$(canonical_key_path "$key")" \
+        "$(canonical_object_path "$key")" \
         "" \
         "$(object_url "$key")" \
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
@@ -492,7 +535,7 @@ cmd_rename() {
     # CopyObject is a PUT with an empty request body.
     sign_and_curl \
         "PUT" \
-        "$(canonical_key_path "$new_key")" \
+        "$(canonical_object_path "$new_key")" \
         "" \
         "$(object_url "$new_key")" \
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
@@ -501,6 +544,24 @@ cmd_rename() {
         "discard" || return $?
 
     cmd_delete "$old_key"
+}
+
+# ---------------------------------------------------------------------------
+# mb - create the configured bucket
+# ---------------------------------------------------------------------------
+cmd_mb() {
+    [[ $# -eq 0 ]] || die "usage: $SCRIPT_NAME mb"
+    local payload_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    sign_and_curl \
+        "PUT" \
+        "$(canonical_key_path "/${S3_BUCKET}")" \
+        "" \
+        "${S3_ENDPOINT}/$(uri_encode "$S3_BUCKET" 0)" \
+        "$payload_hash" \
+        "" \
+        "" \
+        "discard"
 }
 
 # ---------------------------------------------------------------------------
@@ -520,7 +581,7 @@ cmd_mkdir() {
 
     sign_and_curl \
         "PUT" \
-        "$(canonical_key_path "$prefix")" \
+        "$(canonical_object_path "$prefix")" \
         "" \
         "$(object_url "$prefix")" \
         "$payload_hash" \
@@ -578,7 +639,7 @@ cmd_ls() {
 
         sign_and_curl \
             "GET" \
-            "/" \
+            "$(canonical_bucket_list_path)" \
             "$canonical_query" \
             "$(bucket_url)/?${actual_query}" \
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
@@ -630,6 +691,7 @@ main() {
         delete) cmd_delete "$@" ;;
         rename) cmd_rename "$@" ;;
         mkdir)  cmd_mkdir "$@" ;;
+        mb)     cmd_mb "$@" ;;
         ls)     cmd_ls "$@" ;;
         -h|--help|help|"") usage ;;
         *) die "unknown command: $command (use --help)" ;;
